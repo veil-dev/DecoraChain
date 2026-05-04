@@ -156,5 +156,5 @@ decora_chain/
 MIT © 2025 DecoraChain
 
 ## CONTRACT
-https://stellar.expert/explorer/testnet/tx/3861b8e2d6c1b6ab0ed98e4872b72e22321a413d4853640d1ea917909ba86285
-https://lab.stellar.org/r/testnet/contract/CCAHL2ZU3I25QIV2UV4LNFW36RADN3RRI76HUZIRPTFJSW3C2ZU4MHUK
+https://stellar.expert/explorer/testnet/tx/3fc8847ae60eb03cbebf3c3f5074e0592c88f533ccd40611d3776b1fd245aad1
+https://lab.stellar.org/r/testnet/contract/CCEMANUWO27NK7G5MZ2GXUEAHL4ZOMX7IJ7CF3NLFBH7EQ2HUM6CPEZ6
