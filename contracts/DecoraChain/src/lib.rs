@@ -1,37 +1,52 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short,
-    Address, Env, Map, String, Symbol, Vec,
+    contract, contractimpl, contracttype,
+    panic_with_error, contracterror,
+    Address, Env, String, Symbol,
 };
 
 // ─────────────────────────────────────────────
-//  Storage key types
+//  Soroban-native error codes
+//  #[contracterror] is the ONLY way to define
+//  errors that work with soroban_sdk::Error
+// ─────────────────────────────────────────────
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum Error {
+    DesignNotFound = 1,
+    BelowClaimMin  = 2,
+    AlreadyClaimed = 3,
+}
+
+// ─────────────────────────────────────────────
+//  Storage keys
 // ─────────────────────────────────────────────
 #[contracttype]
 pub enum DataKey {
-    Design(Address),       // stores a user's submitted room design
-    ThemeVotes(Symbol),    // tracks vote count for a given theme
-    RewardBalance(Address),// XLM-equivalent reward points per user
-    DesignCount,           // global counter of submitted designs
+    Design(Address),
+    ThemeVotes(Symbol),
+    RewardBalance(Address),
+    DesignCount,
 }
 
 // ─────────────────────────────────────────────
-//  Core data structures
+//  Data struct
 // ─────────────────────────────────────────────
-
-/// A room design submitted by a user
 #[contracttype]
 #[derive(Clone)]
 pub struct RoomDesign {
-    pub owner: Address,        // wallet address of the designer
-    pub layout_hash: String,   // IPFS hash or unique hash of the room layout
-    pub theme: Symbol,         // e.g. "minimalist", "boho", "industrial"
-    pub upvotes: u32,          // community upvotes for this design
-    pub reward_claimed: bool,  // whether the creator claimed their DCOR reward
+    pub owner: Address,
+    pub layout_hash: String,
+    pub theme: Symbol,
+    pub upvotes: u32,
+    pub reward_claimed: bool,
 }
 
 // ─────────────────────────────────────────────
-//  Contract
+//  Contract — all fns return plain types.
+//  Failures use panic_with_error! which emits
+//  a proper contract error (not a Wasm trap).
 // ─────────────────────────────────────────────
 #[contract]
 pub struct DecoraChain;
@@ -39,174 +54,127 @@ pub struct DecoraChain;
 #[contractimpl]
 impl DecoraChain {
 
-    /// Submit a new room design with a layout hash and theme.
-    /// The designer must authorize this call.
-    /// On success: design is stored, reward balance initialized,
-    /// global design counter incremented.
+    /// Submit a room design. Returns new global design count.
     pub fn submit_design(
         env: Env,
         owner: Address,
         layout_hash: String,
         theme: Symbol,
     ) -> u32 {
-        // Require the owner's signature — no one else can submit on their behalf
         owner.require_auth();
 
-        // Build the design record
         let design = RoomDesign {
             owner: owner.clone(),
             layout_hash,
-            theme: theme.clone(),
+            theme,
             upvotes: 0,
             reward_claimed: false,
         };
 
-        // Persist the design keyed by owner address
-        env.storage()
-            .persistent()
-            .set(&DataKey::Design(owner.clone()), &design);
+        env.storage().persistent().set(&DataKey::Design(owner.clone()), &design);
 
-        // Initialize reward balance to 0 DCOR tokens if not already set
-        if !env
-            .storage()
-            .persistent()
-            .has(&DataKey::RewardBalance(owner.clone()))
-        {
-            env.storage()
-                .persistent()
-                .set(&DataKey::RewardBalance(owner.clone()), &0u64);
+        if !env.storage().persistent().has(&DataKey::RewardBalance(owner.clone())) {
+            env.storage().persistent().set(&DataKey::RewardBalance(owner.clone()), &0u64);
         }
 
-        // Increment and return the global design counter
-        let count: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::DesignCount)
-            .unwrap_or(0);
+        let count: u32 = env.storage().persistent()
+            .get(&DataKey::DesignCount).unwrap_or(0);
         let new_count = count + 1;
-        env.storage()
-            .persistent()
-            .set(&DataKey::DesignCount, &new_count);
+        env.storage().persistent().set(&DataKey::DesignCount, &new_count);
 
         new_count
     }
 
-    /// Upvote a room design owned by `designer`.
-    /// The voter must authorize. Each upvote mints 1 DCOR point to the designer.
+    /// Upvote a design. Awards 1 DCOR to the designer.
+    /// Panics with Error::DesignNotFound (code 1) — not a Wasm trap.
     pub fn upvote_design(env: Env, voter: Address, designer: Address) {
-        // Voter must sign — prevents bot upvoting
         voter.require_auth();
 
-        // Fetch the target design
-        let mut design: RoomDesign = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Design(designer.clone()))
-            .expect("Design not found");
+        let maybe_design: Option<RoomDesign> = env.storage().persistent()
+            .get(&DataKey::Design(designer.clone()));
 
-        // Increment the upvote counter on the design
+        let mut design = match maybe_design {
+            Some(d) => d,
+            None => panic_with_error!(&env, Error::DesignNotFound),
+        };
+
         design.upvotes += 1;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Design(designer.clone()), &design);
+        env.storage().persistent().set(&DataKey::Design(designer.clone()), &design);
 
-        // Award 1 DCOR reward point to the designer for each upvote received
-        let current_balance: u64 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::RewardBalance(designer.clone()))
-            .unwrap_or(0);
-        env.storage()
-            .persistent()
-            .set(&DataKey::RewardBalance(designer.clone()), &(current_balance + 1));
+        let balance: u64 = env.storage().persistent()
+            .get(&DataKey::RewardBalance(designer.clone())).unwrap_or(0);
+        env.storage().persistent()
+            .set(&DataKey::RewardBalance(designer.clone()), &(balance + 1));
     }
 
-    /// Claim DCOR rewards accumulated from upvotes.
-    /// Requires at least 10 DCOR to claim. Resets balance after claim.
-    /// In production this triggers an XLM/USDC transfer via Stellar anchor.
+    /// Claim accumulated DCOR. Requires >= 10.
+    /// Panics with Error::BelowClaimMin (code 2) if threshold not met.
     pub fn claim_rewards(env: Env, owner: Address) -> u64 {
         owner.require_auth();
 
-        let balance: u64 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::RewardBalance(owner.clone()))
-            .unwrap_or(0);
+        let balance: u64 = env.storage().persistent()
+            .get(&DataKey::RewardBalance(owner.clone())).unwrap_or(0);
 
-        // Enforce minimum claim threshold of 10 DCOR points
-        assert!(balance >= 10, "Minimum 10 DCOR required to claim");
-
-        // Mark design's reward_claimed flag
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::Design(owner.clone()))
-        {
-            let mut design: RoomDesign = env
-                .storage()
-                .persistent()
-                .get(&DataKey::Design(owner.clone()))
-                .unwrap();
-            design.reward_claimed = true;
-            env.storage()
-                .persistent()
-                .set(&DataKey::Design(owner.clone()), &design);
+        if balance < 10 {
+            panic_with_error!(&env, Error::BelowClaimMin);
         }
 
-        // Reset balance to 0 after claim
-        env.storage()
-            .persistent()
-            .set(&DataKey::RewardBalance(owner.clone()), &0u64);
+        // Mark reward_claimed on the design if it exists
+        let maybe_design: Option<RoomDesign> = env.storage().persistent()
+            .get(&DataKey::Design(owner.clone()));
+        if let Some(mut design) = maybe_design {
+            design.reward_claimed = true;
+            env.storage().persistent().set(&DataKey::Design(owner.clone()), &design);
+        }
 
-        balance // return the amount that was claimed
+        env.storage().persistent().set(&DataKey::RewardBalance(owner.clone()), &0u64);
+
+        balance
     }
 
-    /// Cast a vote for a community theme (e.g. "boho", "industrial").
-    /// Theme vote tallies guide the AI recommendation engine off-chain.
+    /// Vote for a community theme.
     pub fn vote_theme(env: Env, voter: Address, theme: Symbol) {
         voter.require_auth();
 
-        let current: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::ThemeVotes(theme.clone()))
-            .unwrap_or(0);
-        env.storage()
-            .persistent()
-            .set(&DataKey::ThemeVotes(theme), &(current + 1));
+        let current: u32 = env.storage().persistent()
+            .get(&DataKey::ThemeVotes(theme.clone())).unwrap_or(0);
+        env.storage().persistent().set(&DataKey::ThemeVotes(theme), &(current + 1));
     }
 
-    // ── Read-only views ──────────────────────────────────────
+    // ── READ-ONLY ─────────────────────────────────────────────
 
-    /// Returns the room design for a given owner address
+    /// Returns the design for owner.
+    /// Panics with Error::DesignNotFound (code 1) — clean contract error, not Wasm trap.
+    /// Call has_design() first if you want to avoid the error.
     pub fn get_design(env: Env, owner: Address) -> RoomDesign {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Design(owner))
-            .expect("Design not found")
+        let maybe: Option<RoomDesign> = env.storage().persistent()
+            .get(&DataKey::Design(owner));
+        match maybe {
+            Some(d) => d,
+            None => panic_with_error!(&env, Error::DesignNotFound),
+        }
     }
 
-    /// Returns the DCOR reward balance for a user
+    /// Safe boolean check — always call this before get_design.
+    pub fn has_design(env: Env, owner: Address) -> bool {
+        env.storage().persistent().has(&DataKey::Design(owner))
+    }
+
+    /// Returns DCOR balance; 0 if never submitted.
     pub fn get_reward_balance(env: Env, owner: Address) -> u64 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::RewardBalance(owner))
-            .unwrap_or(0)
+        env.storage().persistent()
+            .get(&DataKey::RewardBalance(owner)).unwrap_or(0)
     }
 
-    /// Returns the vote count for a specific theme
+    /// Returns vote count for a theme; 0 if never voted.
     pub fn get_theme_votes(env: Env, theme: Symbol) -> u32 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::ThemeVotes(theme))
-            .unwrap_or(0)
+        env.storage().persistent()
+            .get(&DataKey::ThemeVotes(theme)).unwrap_or(0)
     }
 
-    /// Returns the total number of designs submitted globally
+    /// Returns total designs submitted globally.
     pub fn get_design_count(env: Env) -> u32 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::DesignCount)
-            .unwrap_or(0)
+        env.storage().persistent()
+            .get(&DataKey::DesignCount).unwrap_or(0)
     }
 }
